@@ -14,26 +14,26 @@ from sacred import Experiment
 from sacred.observers import MongoObserver
 import time
 
-ex = Experiment('anime-wgangp')
-ex.observers.append(MongoObserver.create(url='10.128.0.10:27017',
-                                         db_name='experiments'))
+ex = Experiment('anime-wgangp-fc')
+ex.observers.append(MongoObserver.create(url='10.128.0.10:27017', db_name='experiments'))
+dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 @ex.config
 def config():
     ysize = 45
     zsize = 100
-    isize = 64
+    isize = 128
     batchsize = 64
-    nepochs = 100
+    nepochs = 1000
 
     gen_extra_blocks = 16
     gen_up_count = 3
     discrim_extra_blocks = 0
-    discrim_blk_per_seg = 3
+    discrim_blk_per_seg = 2
 
     # number of discriminator updates per iter
-    dratio = 5
+    dratio = 2
 
     # number of generator updates per iter
     genperiter = 1
@@ -55,13 +55,13 @@ def config():
     lambda_ = 10
 
     # number of iterations to disable generator at start
-    discrim_only_iters = 75
+    discrim_only_iters = 0
 
     # interval to sample images generated
     sample_epoch_interval = 1
 
     cuda = torch.cuda.is_available()
-    resume = False
+    resume = True
     resume_partial = False
 
     dataset_transforms = transforms.Compose([
@@ -83,21 +83,18 @@ def main(_run, lambda_, discrim_only_iters,
         print('Using CPU.')
     starttime = time.time()
     dataset = CustomDatasetFolder(
-        root='cropped256', transform=dataset_transforms)
+        root='images', transform=dataset_transforms)
     init_vecs()
 
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batchsize,
                                              shuffle=False, num_workers=2)
 
-    noise = torch.FloatTensor(batchsize, zsize)
-    yfake = torch.FloatTensor(batchsize, ysize)
-    yfixed = torch.FloatTensor(batchsize, ysize)
-    noisefixed = torch.FloatTensor(batchsize, zsize).normal_(0, 1)
+    noise = torch.FloatTensor(batchsize, zsize).to(dev)
+    yfixed = torch.FloatTensor(batchsize, ysize).to(dev)
+    noisefixed = torch.FloatTensor(batchsize, zsize).normal_(0, 1).to(dev)
 
-    loss = torch.nn.BCELoss()
-
-    netG = Generator()
-    netD = Discriminator()
+    netG = nn.DataParallel(Generator()).to(dev)
+    netD = nn.DataParallel(Discriminator()).to(dev)
 
     # Initialize optimizers
     optimizerD = optim.Adam(
@@ -107,9 +104,6 @@ def main(_run, lambda_, discrim_only_iters,
     xavier_init(netG)
     xavier_init(netD)
 
-    one = torch.FloatTensor([1])
-    mone = one * -1
-
     # Make directories
     try:
         os.mkdir('samples')
@@ -118,42 +112,31 @@ def main(_run, lambda_, discrim_only_iters,
         pass
 
 #    train_log = open('checkpoints/train.log', 'w')
-    if cuda:
-        netG = netG.cuda()
-        netD = netD.cuda()
-        one = one.cuda()
-        mone = mone.cuda()
-        noise = noise.cuda()
-        noisefixed = noisefixed.cuda()
-        yfake = yfake.cuda()
-        yfixed = yfixed.cuda()
 
     # generate fixed y for samples
     gen_condit_vec_(yfixed)
 
     if resume:
+        print('resume')
         # Load checkpoint from file
-        checkpoint = torch.load('checkpoints/checkpoint-latest.pth.tar')
-        netD.load_state_dict(checkpoint.D_state_dict)
-        netG.load_state_dict(checkpoint.G_state_dict)
-        optimizerD.load_state_dict(checkpoint.optimizerD)
-        optimizerG.load_state_dict(checkpoint.optimizerG)
-        noisefixed = checkpoint.noisefixed
-        yfixed = checkpoint.yfixed
-        if cuda:
-            noisefixed = noisefixed.cuda()
-            yfixed = yfixed.cuda()
-        startepoch = checkpoint.epoch
+        checkpoint = torch.load('./checkpoints/checkpoint-{}.pth.tar'.format(input()))
+        netD.load_state_dict(checkpoint['D_state_dict'])
+        netG.load_state_dict(checkpoint['G_state_dict'])
+#        optimizerD.load_state_dict(checkpoint['optimizerD'])
+#        optimizerG.load_state_dict(checkpoint['optimizerG'])
+        noisefixed = checkpoint['noisefixed'].to(dev)
+        yfixed = checkpoint['yfixed'].to(dev)
+        startepoch = checkpoint['epoch']
     elif resume_partial:
         checkpoint = torch.load('checkpoints/checkpoint-transfer.pth.tar')
         D_dict = netD.state_dict()
-        D_pretrain_dict = checkpoint.D_state_dict
+        D_pretrain_dict = checkpoint['D_state_dict']
         D_pretrain_dict = {k: v for k, v in D_pretrain_dict.items() if k in D_dict}
         D_dict.update(D_pretrain_dict)
         netD.load_state_dict(D_pretrain_dict)
 
         G_dict = netG.state_dict()
-        G_pretrain_dict = checkpoint.G_state_dict
+        G_pretrain_dict = checkpoint['G_state_dict']
         G_pretrain_dict = {k: v for k, v in G_pretrain_dict.items() if k in G_dict}
         G_dict.update(G_pretrain_dict)
         netG.load_state_dict(G_pretrain_dict)
@@ -161,19 +144,16 @@ def main(_run, lambda_, discrim_only_iters,
     else:
         startepoch = 0
 
-    labelsn1 = torch.FloatTensor(batchsize, 1)
-    labels1 = torch.FloatTensor(batchsize, 1)
+    labelsn1 = torch.FloatTensor(batchsize, 1).to(dev)
+    labels1 = torch.FloatTensor(batchsize, 1).to(dev)
 
-    if cuda:
-        labelsn1 = labelsn1.cuda()
-        labels1 = labels1.cuda()
     labelsn1.data.fill_(-1.)
     labels1.data.fill_(1.)
     discr_iters = 0
     gen_iters = 0
     step = 0
-    for epoch in range(startepoch, nepochs):
 
+    for epoch in range(startepoch, nepochs):
         data_iter = iter(dataloader)
         i = 0
         # Train on all batches
@@ -182,55 +162,52 @@ def main(_run, lambda_, discrim_only_iters,
             netD.zero_grad()
             # Train on real samples
             real, yreal = data_iter.next()
-            if cuda:
-                real = real.cuda()
-                yreal = yreal.cuda()
-            batchsz = real.size(0)
-
-            if cuda:
-                real = real.cuda()
+            real = real.to(dev)
+            yreal = yreal.to(dev)
 
             # Train on fake samples
             noise.normal_(0, 1)
             with torch.no_grad():
                 # compute G(z, y)
-                gen_condit_vec_(yfake)
                 fake = netG(noise, yreal).detach()
 
             D_real = netD(real, yreal)
             D_fake = netD(fake, yreal)
 
-            mean_D_fake = D_fake.mean()
-            mean_D_real = D_real.mean()
+            loss_D_fake = nn.functional.relu(1 + D_fake).mean()
+            loss_D_real = nn.functional.relu(1 - D_real).mean()
 
             realacc = labels1.eq((D_real / D_real.abs()).round()).sum().float() / batchsize
             fakeacc = labelsn1.eq((D_fake / D_fake.abs()).round()).sum().float() / batchsize
 
-            gradient_penalty = calc_gradient_penalty(netD, real, fake, yreal, yfake)
+            gradient_penalty = calc_gradient_penalty(netD, real, fake, yreal)
             cumulacc = (realacc + fakeacc) / 2
-            loss_D = mean_D_fake - mean_D_real + gradient_penalty
-            loss_D.backward(one)
-            W_loss = mean_D_fake - mean_D_real
+            loss_D = loss_D_fake + loss_D_real + gradient_penalty
+            W_loss = loss_D_fake + loss_D_real
+            loss_D.backward()
 
             optimizerD.step()
 
-            print('D epoch %d batch %s | BCE ( real %.4f   \t racc %.2f%%\t fake %.4f\t facc %.2f%%\t cumul %.4f\t gradpnlty %.4f\t wass %.4f )' % (
-                epoch, str(i).rjust(4), mean_D_real.item(), realacc * 100., mean_D_fake.item(), fakeacc * 100., loss_D, gradient_penalty, W_loss))
+            D_gamma = float(netD.module.sa.gamma)
+
+            print('D epoch %d batch %s | BCE ( real %.4f   \t racc %.2f%%\t fake %.4f\t facc %.2f%%\t cumul %.4f\t gradpnlty %.4f\t wass %.4f\t gamma %.5f )' % (
+                epoch, str(i).rjust(4), loss_D_real.item(), realacc * 100., loss_D_fake.item(), fakeacc * 100., loss_D, gradient_penalty, W_loss, D_gamma))
 #            train_log.write('D epoch %d batch %d | BCE ( real %f\tfake %f\tcumul %f )\n' % (
-#                epoch, i, mean_D_real.item(), mean_D_fake.item(), mean_D_real.item() + mean_D_fake.item()))
+#                epoch, i, loss_D_real.item(), loss_D_fake.item(), loss_D_real.item() + loss_D_fake.item()))
 #            train_log.flush()
             i += 1
-            _run.log_scalar('discrim.loss.real', float(mean_D_real.item()), step)
-            _run.log_scalar('discrim.loss.fake', float(mean_D_fake.item()), step)
+            _run.log_scalar('discrim.loss.real', float(loss_D_real.item()), step)
+            _run.log_scalar('discrim.loss.fake', float(loss_D_fake.item()), step)
             _run.log_scalar('discrim.loss.wasserstein', float(W_loss), step)
             _run.log_scalar('discrim.loss.cumul', float(loss_D), step)
             _run.log_scalar('discrim.accuracy.real', float(realacc), step)
             _run.log_scalar('discrim.accuracy.fake', float(fakeacc), step)
             _run.log_scalar('discrim.accuracy.cumul', float(cumulacc), step)
             _run.log_scalar('discrim.grad_penalty', float(gradient_penalty), step)
+            _run.log_scalar('discrim.gamma', float(D_gamma), step)
             step += 1
 
-            if discr_iters >= discrim_only_iters and i % dratio == 0 and loss_D < dcutoffthreshold:
+            if (discr_iters >= discrim_only_iters) and i % dratio == 0 and loss_D < dcutoffthreshold:
                 G_i = 0
 #                dcutoffthreshold = (dcutoffthreshold + loss_D) / 2
 
@@ -239,24 +216,25 @@ def main(_run, lambda_, discrim_only_iters,
                 for G_i in range(genperiter):
                     # Update Generator
 
-                    gen_condit_vec_(yfake)
                     netG.zero_grad()
                     noise.normal_(0, 1)
-                    genimg = netG(noise, yfake)
-                    dg_z = netD(genimg, yfake)
+                    genimg = netG(noise, yreal)
+                    dg_z = netD(genimg, yreal)
 
                     loss_G = dg_z.mean()
-                    loss_G.backward(mone)
+                    (-loss_G).backward()
                     optimizerG.step()
                     Gacc = labels1.eq((dg_z / dg_z.abs()).round()).sum().float() / batchsize
 
-                    print('G epoch {} iter {} | BCE {} | acc {}%'.format(
-                        epoch, str(gen_iters).rjust(5), loss_G, int(Gacc * 100)))
+                    G_gamma = float(netG.module.sa.gamma)
+                    print('G epoch {} iter {} | BCE {} | acc {}% | gamma {}'.format(
+                        epoch, str(gen_iters).rjust(5), loss_G, int(Gacc * 100), G_gamma))
 #                    train_log.write(
 #                        'G epoch {} iter {} | BCE {} | acc {}%\n'.format(epoch, G_i, loss_G.item(), Gacc * 100))
 #                    train_log.flush()
 
                     _run.log_scalar('generator.loss', float(loss_G.item()), step)
+                    _run.log_scalar('generator.gamma', float(G_gamma), step)
                     _run.log_scalar('generator.accuracy', float(Gacc), step)
                     gen_iters += 1
                     step += 1
@@ -275,7 +253,11 @@ def main(_run, lambda_, discrim_only_iters,
 
             discr_iters += 1
         if epoch % sample_epoch_interval == 0:
-            fake = netG(noisefixed, yfixed)
+            with torch.no_grad():
+                netG.eval()
+                fake = netG(noisefixed, yfixed)
+                netG.train()
+
             vutils.save_image(fake.data.view(batchsize, 3, isize, isize),
                               'samples/fake_samples_epoch_%d_genit_%d.png' % (epoch, gen_iters))
             ex.add_artifact('samples/fake_samples_epoch_%d_genit_%d.png' % (epoch, gen_iters))
@@ -302,11 +284,11 @@ class DiscrimBlock(nn.Module):
     @ex.capture
     def __init__(self, in_channels, sidedim):
         super(DiscrimBlock, self).__init__()
-        self.pad1 = nn.ReplicationPad2d(1)
+        self.pad1 = nn.ReflectionPad2d(1)
         self.conv1 = nn.Conv2d(in_channels, in_channels, 3)
         self.ln1 = nn.LayerNorm((in_channels, sidedim, sidedim))
         self.relu1 = nn.LeakyReLU(inplace=True)
-        self.pad2 = nn.ReplicationPad2d(1)
+        self.pad2 = nn.ReflectionPad2d(1)
         self.conv2 = nn.Conv2d(in_channels, in_channels, 3)
         self.ln2 = nn.LayerNorm((in_channels, sidedim, sidedim))
         self.relu2 = nn.LeakyReLU(inplace=True)
@@ -355,7 +337,7 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         main = nn.Sequential()
 
-        main.add_module('init_conv_pad', nn.ReplicationPad2d(1))
+        main.add_module('init_conv_pad', nn.ReflectionPad2d(1))
         main.add_module('init_conv', nn.Conv2d(3 + ysize, 32, 4, 2))
         main.add_module('init_relu', nn.LeakyReLU(inplace=True))
 
@@ -366,8 +348,12 @@ class Discriminator(nn.Module):
         sidedim = isize // 2
         n_segs = 0
         while sidedim > 4:
+            if n_segs == 3:
+                self.sa = Self_Attn(filters)
+                main.add_module('sa', self.sa)
             main.add_module('discrimseg_{}'.format(
-                filters), DiscrimSegment(filters, 3 if n_segs > 1 else 4, sidedim, discrim_blk_per_seg))
+                filters), DiscrimSegment(filters, 3, sidedim, discrim_blk_per_seg))
+
             sidedim //= 2
             filters *= 2
             n_segs += 1
@@ -391,18 +377,18 @@ class Discriminator(nn.Module):
         x = self.ln(x)
         x = self.score(x)
 
-        return x
+        return x.float()
 
 
 class GenResBlock(nn.Module):
     def __init__(self, in_channels):
         super(GenResBlock, self).__init__()
 
-        self.pad1 = nn.ReplicationPad2d(1)
+        self.pad1 = nn.ReflectionPad2d(1)
         self.conv1 = nn.Conv2d(in_channels, in_channels, 3)
         self.bn1 = nn.BatchNorm2d(in_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.pad2 = nn.ReplicationPad2d(1)
+        self.pad2 = nn.ReflectionPad2d(1)
         self.conv2 = nn.Conv2d(in_channels, in_channels, 3)
         self.bn2 = nn.BatchNorm2d(in_channels)
 
@@ -458,9 +444,13 @@ class Generator(nn.Module):
         self.main = main
 
         upscale = nn.Sequential()
+        self.sa = Self_Attn(64)
         for i in range(gen_up_count):
+            if i == 1:
+                upscale.add_module('sa', self.sa)
             upscale.add_module('up_{}'.format(i), GenUpBlock(64))
-        upscale.add_module('padding', nn.ZeroPad2d(4))
+#        upscale.add_module('resf', GenResBlock(64))
+        upscale.add_module('padding', nn.ReflectionPad2d(4))
         upscale.add_module('convf', nn.Conv2d(64, 3, 9))
         upscale.add_module('sigmoid', nn.Sigmoid())
         self.upscale = upscale
@@ -487,35 +477,33 @@ def xavier_init(model):
 
 
 def save_checkpoint(state, epoch):
-    filename = 'checkpoints/checkpoint-%d.pth.tar' % epoch
-    torch.save(state, filename)
     try:
-        os.remove('checkpoints/checkpoint-latest.pth.tar')
+        filename = 'checkpoints/checkpoint-%d.pth.tar' % epoch
+        torch.save(state, filename)
+#        os.remove('checkpoints/checkpoint-latest.pth.tar')
     except Exception:
         pass
-    os.symlink(filename, 'checkpoints/checkpoint-latest.pth.tar')
-#    ex.add_artifact(filename)
+    else:
+        if epoch > 2:
+            os.remove('checkpoints/checkpoint-%d.pth.tar' % (epoch - 2))
 
 
 @ex.capture
-def calc_gradient_penalty(netD, real_data, fake_data, yreal, yfake, batchsize, cuda, lambda_, isize):
+def calc_gradient_penalty(netD, real_data, fake_data, yreal, batchsize, lambda_, isize):
     # via https://github.com/caogang/wgan-gp/
     alpha1 = torch.rand(batchsize, 1)
     alpha = alpha1.expand(batchsize, real_data.nelement(
-    ) / batchsize).contiguous().view(batchsize, 3, isize, isize)
-    alpha = alpha.cuda() if cuda else alpha
+    ) // batchsize).contiguous().view(batchsize, 3, isize, isize)
+    alpha = alpha.to(dev)
 
-    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+    interpolates = (alpha * real_data + ((1 - alpha) * fake_data)).to(dev)
 
-    if cuda:
-        interpolates = interpolates.cuda()
-
+    interpolates.requires_grad_(True)
     D_interpolates = netD(interpolates, yreal)
 
     gradients = grad(outputs=D_interpolates, inputs=interpolates,
-                              grad_outputs=torch.ones(D_interpolates.size()).cuda() if cuda else torch.ones(
-                                  D_interpolates.size()),
-                              create_graph=True, retain_graph=True, only_inputs=True)[0]
+                     grad_outputs=torch.ones(D_interpolates.size()).to(dev),
+                     create_graph=True, retain_graph=True, only_inputs=True)[0]
     gradients = gradients.view(gradients.size(0), -1)
 
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * lambda_
@@ -523,7 +511,7 @@ def calc_gradient_penalty(netD, real_data, fake_data, yreal, yfake, batchsize, c
 
 
 @ex.capture
-def init_vecs(batchsize, cuda):
+def init_vecs(batchsize):
     global eyecolor_onehot
     global hairlen_onehot
     global haircolor_onehot
@@ -531,21 +519,13 @@ def init_vecs(batchsize, cuda):
     global hlo
     global hco
 
-    eyecolor_onehot = torch.LongTensor(batchsize)
-    hairlen_onehot = torch.LongTensor(batchsize)
-    haircolor_onehot = torch.LongTensor(batchsize)
+    eyecolor_onehot = torch.LongTensor(batchsize).to(dev)
+    hairlen_onehot = torch.LongTensor(batchsize).to(dev)
+    haircolor_onehot = torch.LongTensor(batchsize).to(dev)
 
-    eco = torch.ones(batchsize, 11)
-    hlo = torch.ones(batchsize, 3)
-    hco = torch.ones(batchsize, 13)
-
-    if cuda:
-        eyecolor_onehot = eyecolor_onehot.cuda()
-        hairlen_onehot = hairlen_onehot.cuda()
-        haircolor_onehot = haircolor_onehot.cuda()
-        eco = eco.cuda()
-        hlo = hlo.cuda()
-        hco = hco.cuda()
+    eco = torch.ones(batchsize, 11).to(dev)
+    hlo = torch.ones(batchsize, 3).to(dev)
+    hco = torch.ones(batchsize, 12).to(dev)
 
 
 @ex.capture
@@ -557,21 +537,25 @@ def gen_condit_vec_(y, batchsize):
 
     eyecolor_onehot.random_(0, 11)
     hairlen_onehot.random_(0, 3)
-    haircolor_onehot.random_(0, 13)
+    haircolor_onehot.random_(0, 12)
 
     # encode onehot
     y[:, 2:13].scatter_(1, eyecolor_onehot.expand(
         11, batchsize).transpose(0, 1), eco)
     y[:, 13:16].scatter_(1, hairlen_onehot.expand(
         3, batchsize).transpose(0, 1), hlo)
-    y[:, 16:29].scatter_(1, haircolor_onehot.expand(
-        13, batchsize).transpose(0, 1), hco)
+    y[:, 16:28].scatter_(1, haircolor_onehot.expand(
+        12, batchsize).transpose(0, 1), hco)
 
-    y[:, 29:45].random_(0, 2)
+    y[:, 28:44].random_(1, 5)
+    y[:, 28:44] /= 4
+    y[:, 28:44].floor_()
 
     # mask out gender specific
-    y[:, 31] *= y[:, 1]
-    y[:, 33] *= y[:, 1]
+    y[:, 30] *= y[:, 1]
+    y[:, 32] *= y[:, 1]
+
+    y[:, 44].uniform_(0, 1)
 
     return y
 
@@ -585,7 +569,7 @@ class CustomDatasetFolder(data.Dataset):
 
         samples = []
         for f in os.listdir(root):
-            samples.append((f, imgdict[f]))
+            samples.append((f, imgdict[f[:-4] + '.jpg']))
 
         self.samples = samples
 
@@ -612,6 +596,69 @@ class CustomDatasetFolder(data.Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+
+def save_checkpoint(state, epoch):
+    try:
+        filename = 'checkpoints/checkpoint-%d.pth.tar' % epoch
+        torch.save(state, filename)
+#        os.remove('checkpoints/checkpoint-latest.pth.tar')
+    except Exception:
+        pass
+    else:
+        if epoch > 2:
+            try:
+                os.remove('checkpoints/checkpoint-%d.pth.tar' % (epoch - 2))
+            except Exception:
+                pass
+
+
+# (Modified) From https://github.com/heykeetae/Self-Attention-GAN/blob/master/sagan_models.py
+class Self_Attn(nn.Module):
+    """ Self attention Layer"""
+
+    def __init__(self, in_dim):
+        super(Self_Attn, self).__init__()
+
+        self.kernel_size = 1
+
+        self.query_conv = nn.Conv2d(
+            in_channels=in_dim, out_channels=in_dim // 8, kernel_size=self.kernel_size)
+        self.key_conv = nn.Conv2d(
+            in_channels=in_dim, out_channels=in_dim // 8, kernel_size=self.kernel_size)
+        self.value_conv = nn.Conv2d(
+            in_channels=in_dim, out_channels=in_dim, kernel_size=self.kernel_size)
+        self.gamma = nn.Parameter(torch.FloatTensor(1).fill_(0.5))
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        """
+            inputs :
+                x : input feature maps( B X C X W X H)
+            returns :
+                out : self attention value + input feature
+                attention: B X N X N (N is Width*Height)
+        """
+        m_batchsize, C, width, height = x.size()
+
+        px = x
+#        px = nn.functional.pad(px, (1, 1, 1, 1), mode='reflect')
+
+        proj_query = self.query_conv(px).view(
+            m_batchsize, -1, width * height).permute(0, 2, 1)  # B X CX(N)
+        proj_key = self.key_conv(px).view(
+            m_batchsize, -1, width * height)  # B X C x (*W*H)
+        energy = torch.bmm(proj_query, proj_key)  # transpose check
+        attention = self.softmax(energy)  # BX (N) X (N)
+        proj_value = self.value_conv(px).view(
+            m_batchsize, -1, width * height)  # B X C X N
+
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(m_batchsize, C, width, height)
+
+        out = self.gamma * out + x
+        return out
 
 
 if __name__ == '__main__':

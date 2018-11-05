@@ -1,0 +1,9 @@
+#!/bin/bash
+pipenv install
+
+until pipenv run python main.py
+do
+    echo Restarting
+done
+
+python meta_to_vec.py
